@@ -127,29 +127,43 @@ func (s *stateTransitionsSteady) run(ctx context.Context) error {
 		}
 	}()
 
-	for begin := time.Now(); time.Since(begin) < s.Configuration.Duration; iter++ {
+	// The rate is the contract, not the tick count. A time.Ticker holds at most one pending
+	// tick, so any delay in this goroutine longer than the interval -- a collection, the
+	// scheduler on a shared node -- loses a tick at the timer, before the select ever sees it.
+	// At an 833 us interval on a four-core node shared with three workers that was 15 % of
+	// the starts, after the select above was already fixed. So each tick starts as many
+	// workflows as the clock says are owed by now, not one: a lost tick is caught up on the
+	// next, and the ordered rate holds on average whatever the jitter. If the cluster cannot
+	// take it, start latency rises and the consecutive-error stop still ends the run.
+	begin := time.Now()
+	started := 0
+	for time.Since(begin) < s.Configuration.Duration {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case err := <-fatalCh:
 			return err
 		case <-ticker.C:
-			s.Logger.Debugf("Running iteration %v", iter)
-			startWG.Add(1)
-			go func(iter int) {
-				defer startWG.Done()
-				_, err := s.Client.ExecuteWorkflow(
-					ctx,
-					s.NewRun(iter).DefaultStartWorkflowOptions(),
-					"kitchenSink",
-					workflowParams,
-				)
-				// Only send to err ch if there is room just in case
-				select {
-				case errCh <- err:
-				default:
-				}
-			}(iter)
+			owed := int(time.Since(begin) / workflowStartInterval)
+			for ; started < owed; started++ {
+				iter = started + 1
+				s.Logger.Debugf("Running iteration %v", iter)
+				startWG.Add(1)
+				go func(iter int) {
+					defer startWG.Done()
+					_, err := s.Client.ExecuteWorkflow(
+						ctx,
+						s.NewRun(iter).DefaultStartWorkflowOptions(),
+						"kitchenSink",
+						workflowParams,
+					)
+					// Only send to err ch if there is room just in case
+					select {
+					case errCh <- err:
+					default:
+					}
+				}(iter)
+			}
 		}
 	}
 
