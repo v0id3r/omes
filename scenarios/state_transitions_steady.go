@@ -91,22 +91,48 @@ func (s *stateTransitionsSteady) run(ctx context.Context) error {
 	errCh := make(chan error, 10000)
 	ticker := time.NewTicker(workflowStartInterval)
 	defer ticker.Stop()
-	var consecutiveErrCount int
 	iter := 1
 	var startWG sync.WaitGroup
+
+	// Completions are consumed on their own goroutine, so that the pacing loop below waits on
+	// the ticker and nothing else. With both channels in one select, a completion that won the
+	// race left the tick sitting in the ticker's one-slot channel, and the next tick to arrive
+	// while the loop was still on that branch was dropped -- time.Ticker drops ticks for slow
+	// receivers by design. At 600 starts a second the loop had slack and reached 96 % of the
+	// ordered rate; at 1200 it reached 72 %, with the cluster under test idle on every axis
+	// (measured 2026-09-11 on the log-first stand: 862 starts/s against 1200 ordered). The
+	// consecutive-error stop is unchanged: it is still the scenario's one way to fail, and a
+	// generator that dies rather than degrades is the behaviour the campaign relies on.
+	fatalCh := make(chan error, 1)
+	go func() {
+		var consecutiveErrCount int
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-errCh:
+				if err == nil {
+					consecutiveErrCount = 0
+					continue
+				}
+				consecutiveErrCount++
+				if consecutiveErrCount >= maxConsecutiveErrors {
+					select {
+					case fatalCh <- fmt.Errorf("got %v consecutive errors, most recent: %w", maxConsecutiveErrors, err):
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	for begin := time.Now(); time.Since(begin) < s.Configuration.Duration; iter++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-errCh:
-			if err == nil {
-				consecutiveErrCount = 0
-			} else {
-				consecutiveErrCount++
-				if consecutiveErrCount >= maxConsecutiveErrors {
-					return fmt.Errorf("got %v consecutive errors, most recent: %w", maxConsecutiveErrors, err)
-				}
-			}
+		case err := <-fatalCh:
+			return err
 		case <-ticker.C:
 			s.Logger.Debugf("Running iteration %v", iter)
 			startWG.Add(1)
